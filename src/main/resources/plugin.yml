@@ -1,0 +1,18 @@
+name: MCQQSync
+main: top.kdja.mcqqsync.MCQQSync
+version: 1.0.0
+api-version: 1.21
+author: kdj
+description: Sync Minecraft server join/quit/chat to AstrBot via WebSocket
+
+commands:
+  mcqqsync:
+    description: MCQQSync 管理命令
+    usage: /mcqqsync [reload|reconnect]
+    permission: mcqqsync.admin
+    permission-message: 你没有权限使用此命令！
+
+permissions:
+  mcqqsync.admin:
+    description: 允许使用 MCQQSync 命令
+    default: op

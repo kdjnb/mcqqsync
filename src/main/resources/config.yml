@@ -1,0 +1,3 @@
+websocket_url: ws://127.0.0.1:52778  #astrbot端作服务器 端口默认52778
+chat:
+  send_cancelled: false
