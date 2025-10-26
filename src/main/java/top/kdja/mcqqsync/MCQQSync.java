@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
     final String version="1.0.1";
@@ -37,6 +38,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
     private HttpClient httpClient;
     private String token;
     private File tokenFile;
+    private final AtomicBoolean authSent = new AtomicBoolean(false);  // 确保 auth 只发一次 per 连接
 
     @Override
     public void onEnable() {
@@ -131,6 +133,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
                 }
                 webSocket = null;
             }
+            authSent.set(false);  // 重置 auth 标志
             connectWebSocket();
             sender.sendMessage(ChatColor.GREEN + "WebSocket 正在强制重连...");
             return true;
@@ -191,6 +194,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
 
     private void tryReconnect() {
         getLogger().info("MCQQSync 正在尝试重连...");
+        authSent.set(false);  // 重置 auth 标志
         connectWebSocket();
     }
 
@@ -203,12 +207,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
                             @Override
                             public void onOpen(WebSocket webSocket) {
                                 getLogger().info("MCQQSync 已连接到 " + wsUrl);
-                                // 发送认证消息（包含 Token 以供服务器验证）
-                                JsonObject auth = new JsonObject();
-                                auth.addProperty("type", "auth");
-                                auth.addProperty("token", MCQQSync.this.token);
-                                sendJsonAsync(auth);
-                                webSocket.request(1);
+                                webSocket.request(1);  // 只请求消息，不发送 auth
                             }
 
                             @Override
@@ -230,6 +229,12 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
                                 return CompletableFuture.completedFuture(null);
                             }
                         }).join();
+
+                // join() 完成后，连接已打开，安全发送 auth
+                if (!authSent.getAndSet(true)) {
+                    sendAuthIfNeeded();
+                }
+
             } catch (Exception e) {
                 getLogger().warning("MCQQSync 连接失败: " + e.getMessage());
                 try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
@@ -238,13 +243,25 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         });
     }
 
+    private void sendAuthIfNeeded() {
+        if (webSocket == null) return;
+        JsonObject auth = new JsonObject();
+        auth.addProperty("type", "auth");
+        auth.addProperty("token", token);
+        sendJsonAsync(auth);
+        getLogger().info("已发送认证消息 (Token: " + token + ")");
+    }
+
     private void sendJsonAsync(JsonObject obj) {
         if (webSocket == null) {
             getLogger().warning("WS 未连接; 丢包: " + obj.toString());
             return;
         }
-        // 添加 Token 到所有发送的消息中（用于服务器端验证）
-        obj.addProperty("token", token);
+        // 注意：auth 已手动添加 token，这里不重复添加（避免重复字段）
+        // 对于其他事件，sendJsonAsync 会添加 token
+        if (!"auth".equals(obj.get("type").getAsString())) {
+            obj.addProperty("token", token);
+        }
         String txt = obj.toString();
         executor.submit(() -> {
             try {
