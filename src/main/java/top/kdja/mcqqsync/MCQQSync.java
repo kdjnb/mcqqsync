@@ -6,48 +6,103 @@ import org.bukkit.ChatColor;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.command.ConsoleCommandSender;
 import org.bukkit.command.TabCompleter;
+import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.*;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.io.File;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.nio.file.Files;
 import java.time.Instant;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Random;
 import java.util.concurrent.*;
 
 public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
+    final String version="1.0.1";
     private WebSocket webSocket;
     private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "MCQQSync-WS"));
     private HttpClient httpClient;
+    private String token;
+    private File tokenFile;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
+        // 设置默认配置
+        getConfig().addDefault("websocket_url", "ws://127.0.0.1:8765");
+        getConfig().addDefault("chat.send_cancelled", false);
+        getConfig().addDefault("events.join", true);
+        getConfig().addDefault("events.quit", true);
+        getConfig().addDefault("events.chat", true);
+        getConfig().addDefault("events.death", true);
+        getConfig().options().copyDefaults(true);
+        saveConfig();
+
+        // 初始化 Token 文件
+        getDataFolder().mkdirs();
+        tokenFile = new File(getDataFolder(), "token");
+
+        // 生成或加载 Token
+        if (!tokenFile.exists() || (token = loadToken()) == null || token.isEmpty()) {
+            token = generateToken();
+            saveToken(token);
+            getLogger().info("生成新的 Token: " + token);
+        } else {
+            getLogger().info("当前 Token: " + token);
+        }
+
         httpClient = HttpClient.newHttpClient();
         connectWebSocket();
         getServer().getPluginManager().registerEvents(this, this);
         Objects.requireNonNull(getCommand("mcqqsync")).setExecutor(this);
-        Objects.requireNonNull(getCommand("mcqqsync")).setTabCompleter(this);  // 添加命令补全
-        getLogger().info("MCQQSync enabled");
+        Objects.requireNonNull(getCommand("mcqqsync")).setTabCompleter(this);
+        getLogger().info("MCQQSync 已启用");
     }
 
     @Override
     public void onDisable() {
         try {
             if (webSocket != null) {
-                webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "Plugin disabled").join();
+                webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "插件已禁用").join();
             }
         } catch (Exception ignored) {}
         executor.shutdownNow();
-        getLogger().info("MCQQSync disabled");
+        getLogger().info("MCQQSync 已禁用");
+    }
+
+    private String loadToken() {
+        try {
+            if (!tokenFile.exists()) return null;
+            byte[] encodedBytes = Files.readAllBytes(tokenFile.toPath());
+            byte[] decodedBytes = Base64.getDecoder().decode(encodedBytes);
+            return new String(decodedBytes);
+        } catch (Exception e) {
+            getLogger().warning("加载 Token 时出错: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private void saveToken(String token) {
+        try {
+            byte[] tokenBytes = token.getBytes();
+            byte[] encodedBytes = Base64.getEncoder().encode(tokenBytes);
+            Files.write(tokenFile.toPath(), encodedBytes);
+        } catch (Exception e) {
+            getLogger().warning("保存 Token 时出错: " + e.getMessage());
+        }
     }
 
     @Override
@@ -57,7 +112,9 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         }
 
         if (args.length == 0) {
-            sender.sendMessage(ChatColor.YELLOW + "MCQQSync - 子命令: reload (重载配置), reconnect (强制重连)");
+            sender.sendMessage(ChatColor.AQUA + "Ciallo～(∠・ω< )⌒☆");
+            sender.sendMessage(ChatColor.GREEN + "MCQQSync v"+version+" - By 卡带酱 - https://github.com/kdjnb/mcqqsync");
+            sender.sendMessage(ChatColor.YELLOW + "MCQQSync - 子命令: reload (重载配置), reconnect (强制重连), token <get|reset> (Token管理，仅控制台)");
             return true;
         }
 
@@ -68,7 +125,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         } else if (args[0].equalsIgnoreCase("reconnect")) {
             if (webSocket != null) {
                 try {
-                    webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "Force Reconnect").join();
+                    webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "强制重连").join();
                 } catch (Exception e) {
                     getLogger().warning("关闭 WebSocket 时出错: " + e.getMessage());
                 }
@@ -77,8 +134,27 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
             connectWebSocket();
             sender.sendMessage(ChatColor.GREEN + "WebSocket 正在强制重连...");
             return true;
+        } else if (args[0].equalsIgnoreCase("token")) {
+            if (!(sender instanceof ConsoleCommandSender)) {
+                sender.sendMessage(ChatColor.RED + "此命令只能在控制台执行");
+                return true;
+            }
+            if (args.length == 2) {
+                if ("get".equalsIgnoreCase(args[1])) {
+                    sender.sendMessage(ChatColor.GREEN + "当前 Token: " + token);
+                    return true;
+                } else if ("reset".equalsIgnoreCase(args[1])) {
+                    token = generateToken();
+                    saveToken(token);
+                    sender.sendMessage(ChatColor.GREEN + "新 Token 已生成: " + token);
+                    getLogger().info("Token 已重置: " + token);
+                    return true;
+                }
+            }
+            sender.sendMessage(ChatColor.YELLOW + "使用: /mcqqsync token <get|reset>");
+            return true;
         } else {
-            sender.sendMessage(ChatColor.RED + "未知子命令。使用: /mcqqsync <reload|reconnect>");
+            sender.sendMessage(ChatColor.RED + "未知子命令。使用: /mcqqsync <reload|reconnect|token>");
             return true;
         }
     }
@@ -90,13 +166,32 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         }
 
         if (args.length == 1) {
-            // 补全子命令
-            List<String> completions = Arrays.asList("reload", "reconnect");
+            List<String> completions = Arrays.asList("reload", "reconnect", "token");
             return completions.stream()
                     .filter(s -> s.startsWith(args[0].toLowerCase()))
                     .collect(java.util.stream.Collectors.toList());
+        } else if (args.length == 2 && "token".equalsIgnoreCase(args[0])) {
+            List<String> completions = Arrays.asList("get", "reset");
+            return completions.stream()
+                    .filter(s -> s.startsWith(args[1].toLowerCase()))
+                    .collect(java.util.stream.Collectors.toList());
         }
-        return Collections.emptyList();  // 无更多补全
+        return Collections.emptyList();
+    }
+
+    private String generateToken() {
+        String chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+        Random rand = new Random();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < 16; i++) {
+            sb.append(chars.charAt(rand.nextInt(chars.length())));
+        }
+        return sb.toString();
+    }
+
+    private void tryReconnect() {
+        getLogger().info("MCQQSync 正在尝试重连...");
+        connectWebSocket();
     }
 
     private void connectWebSocket() {
@@ -108,12 +203,17 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
                             @Override
                             public void onOpen(WebSocket webSocket) {
                                 getLogger().info("MCQQSync 已连接到 " + wsUrl);
+                                // 发送认证消息（包含 Token 以供服务器验证）
+                                JsonObject auth = new JsonObject();
+                                auth.addProperty("type", "auth");
+                                auth.addProperty("token", MCQQSync.this.token);
+                                sendJsonAsync(auth);
                                 webSocket.request(1);
                             }
 
                             @Override
                             public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-                                getLogger().info("[MCQQSync] recv: " + data);
+                                getLogger().info("[MCQQSync] 收到: " + data);
                                 webSocket.request(1);
                                 return CompletableFuture.completedFuture(null);
                             }
@@ -126,20 +226,12 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
                             @Override
                             public CompletionStage<?> onClose(WebSocket ws, int statusCode, String reason) {
                                 getLogger().info("MCQQSync WebSocket 连接关闭: " + statusCode + " " + reason);
-                                // 简单重连机制：延后重连
-                                executor.schedule(this::tryReconnect, 5, TimeUnit.SECONDS);
+                                executor.schedule(MCQQSync.this::tryReconnect, 5, TimeUnit.SECONDS);
                                 return CompletableFuture.completedFuture(null);
-                            }
-
-                            // helper to call from onClose
-                            private void tryReconnect() {
-                                getLogger().info("MCQQSync 正尝试重连...");
-                                connectWebSocket();
                             }
                         }).join();
             } catch (Exception e) {
                 getLogger().warning("MCQQSync 连接失败: " + e.getMessage());
-                // 简单重试
                 try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
                 connectWebSocket();
             }
@@ -151,6 +243,8 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
             getLogger().warning("WS 未连接; 丢包: " + obj.toString());
             return;
         }
+        // 添加 Token 到所有发送的消息中（用于服务器端验证）
+        obj.addProperty("token", token);
         String txt = obj.toString();
         executor.submit(() -> {
             try {
@@ -163,6 +257,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent e) {
+        if (!getConfig().getBoolean("events.join", true)) return;
         JsonObject o = new JsonObject();
         o.addProperty("type", "join");
         o.addProperty("player", e.getPlayer().getName());
@@ -173,6 +268,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent e) {
+        if (!getConfig().getBoolean("events.quit", true)) return;
         JsonObject o = new JsonObject();
         o.addProperty("type", "quit");
         o.addProperty("player", e.getPlayer().getName());
@@ -183,6 +279,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onPlayerChat(AsyncPlayerChatEvent e) {
+        if (!getConfig().getBoolean("events.chat", true)) return;
         if (e.isCancelled() && !getConfig().getBoolean("chat.send_cancelled", false)) return;
         String raw = ChatColor.stripColor(e.getMessage());
         JsonObject o = new JsonObject();
@@ -190,6 +287,23 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("player", e.getPlayer().getName());
         o.addProperty("uuid", e.getPlayer().getUniqueId().toString());
         o.addProperty("message", raw);
+        o.addProperty("time", Instant.now().toEpochMilli());
+        sendJsonAsync(o);
+    }
+
+    @EventHandler
+    public void onPlayerDeath(PlayerDeathEvent e) {
+        if (!getConfig().getBoolean("events.death", true)) return;
+        Player player = e.getEntity();
+        String deathMsg = e.getDeathMessage();
+        if (deathMsg != null) {
+            deathMsg = ChatColor.stripColor(deathMsg);
+        }
+        JsonObject o = new JsonObject();
+        o.addProperty("type", "death");
+        o.addProperty("player", player.getName());
+        o.addProperty("uuid", player.getUniqueId().toString());
+        o.addProperty("message", deathMsg != null ? deathMsg : "");
         o.addProperty("time", Instant.now().toEpochMilli());
         sendJsonAsync(o);
     }

@@ -1,6 +1,6 @@
 name: MCQQSync
 main: top.kdja.mcqqsync.MCQQSync
-version: 1.0.0
+version: 1.0.1
 api-version: 1.21
 author: kdj
 description: Sync Minecraft server join/quit/chat to AstrBot via WebSocket

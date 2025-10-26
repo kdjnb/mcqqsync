@@ -6,7 +6,7 @@
 
     <groupId>top.kdja</groupId>
     <artifactId>mcqqsync</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <name>mcqqsync</name>
     <packaging>jar</packaging>
 
