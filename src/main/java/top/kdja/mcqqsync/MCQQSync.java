@@ -39,6 +39,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
     private String token;
     private File tokenFile;
     private final AtomicBoolean authSent = new AtomicBoolean(false);  // 确保 auth 只发一次 per 连接
+    private boolean showAllLog = false;  // 详细日志开关
 
     @Override
     public void onEnable() {
@@ -50,8 +51,11 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         getConfig().addDefault("events.quit", true);
         getConfig().addDefault("events.chat", true);
         getConfig().addDefault("events.death", true);
+        getConfig().addDefault("show_all_log", false);  // 新增：详细日志开关
         getConfig().options().copyDefaults(true);
         saveConfig();
+
+        showAllLog = getConfig().getBoolean("show_all_log", false);  // 加载开关
 
         // 初始化 Token 文件
         getDataFolder().mkdirs();
@@ -122,7 +126,8 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
 
         if (args[0].equalsIgnoreCase("reload")) {
             reloadConfig();
-            sender.sendMessage(ChatColor.GREEN + "配置已重载");
+            showAllLog = getConfig().getBoolean("show_all_log", false);  // 重新加载开关
+            sender.sendMessage(ChatColor.GREEN + "配置已重载（详细日志: " + (showAllLog ? "启用" : "禁用") + "）");
             return true;
         } else if (args[0].equalsIgnoreCase("reconnect")) {
             if (webSocket != null) {
@@ -200,6 +205,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
 
     private void connectWebSocket() {
         final String wsUrl = getConfig().getString("websocket_url", "ws://127.0.0.1:8765");
+        if (showAllLog) getLogger().info("详细: 尝试连接到 " + wsUrl);
         executor.submit(() -> {
             try {
                 webSocket = httpClient.newWebSocketBuilder()
@@ -207,47 +213,61 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
                             @Override
                             public void onOpen(WebSocket webSocket) {
                                 getLogger().info("MCQQSync 已连接到 " + wsUrl);
+                                if (showAllLog) getLogger().info("详细: onOpen 回调触发，请求消息流");
                                 webSocket.request(1);  // 只请求消息，不发送 auth
                             }
 
                             @Override
                             public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
                                 getLogger().info("[MCQQSync] 收到: " + data);
+                                if (showAllLog) getLogger().info("详细: 收到消息长度: " + data.length() + " | 最后分片: " + last);
                                 webSocket.request(1);
                                 return CompletableFuture.completedFuture(null);
                             }
 
                             @Override
                             public void onError(WebSocket webSocket, Throwable error) {
-                                getLogger().warning("MCQQSync WebSocket 错误: " + error);
+                                getLogger().warning("MCQQSync WebSocket 错误: " + error.getMessage());
+                                if (showAllLog) {
+                                    error.printStackTrace();  // 打印完整栈
+                                    getLogger().info("详细: 错误类型: " + error.getClass().getSimpleName());
+                                }
                             }
 
                             @Override
                             public CompletionStage<?> onClose(WebSocket ws, int statusCode, String reason) {
-                                getLogger().info("MCQQSync WebSocket 连接关闭: " + statusCode + " " + reason);
-                                executor.schedule(MCQQSync.this::tryReconnect, 5, TimeUnit.SECONDS);
+                                getLogger().info("MCQQSync WebSocket 连接关闭: " + statusCode + " " + (reason != null ? " - 原因: " + reason : ""));
+                                if (showAllLog) getLogger().info("详细: 关闭原因字符串: " + (reason != null ? reason : "null"));
+                                executor.schedule(MCQQSync.this::tryReconnect, 10, TimeUnit.SECONDS);  // 延长重连间隔到 10s
                                 return CompletableFuture.completedFuture(null);
                             }
                         }).join();
 
-                // join() 完成后，连接已打开，安全发送 auth
+                // join() 完成后，延迟 500ms 发送 auth，给服务器缓冲
                 if (!authSent.getAndSet(true)) {
-                    sendAuthIfNeeded();
+                    executor.schedule(this::sendAuthIfNeeded, 500, TimeUnit.MILLISECONDS);
                 }
 
             } catch (Exception e) {
                 getLogger().warning("MCQQSync 连接失败: " + e.getMessage());
-                try { Thread.sleep(5000); } catch (InterruptedException ignored) {}
-                connectWebSocket();
+                if (showAllLog) {
+                    e.printStackTrace();  // 打印完整栈
+                    getLogger().info("详细: 连接异常类型: " + e.getClass().getSimpleName());
+                }
+                executor.schedule(this::tryReconnect, 10, TimeUnit.SECONDS);  // 失败时也延长时间
             }
         });
     }
 
     private void sendAuthIfNeeded() {
-        if (webSocket == null) return;
+        if (webSocket == null) {
+            getLogger().warning("尝试发送 auth 时 WS 已关闭");
+            return;
+        }
         JsonObject auth = new JsonObject();
         auth.addProperty("type", "auth");
         auth.addProperty("token", token);
+        if (showAllLog) getLogger().info("详细: 准备发送 auth JSON: " + auth.toString());
         sendJsonAsync(auth);
         getLogger().info("已发送认证消息 (Token: " + token + ")");
     }
@@ -255,19 +275,26 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
     private void sendJsonAsync(JsonObject obj) {
         if (webSocket == null) {
             getLogger().warning("WS 未连接; 丢包: " + obj.toString());
+            if (showAllLog) getLogger().info("详细: 丢包原因: webSocket 为 null");
             return;
         }
         // 注意：auth 已手动添加 token，这里不重复添加（避免重复字段）
-        // 对于其他事件，sendJsonAsync 会添加 token
         if (!"auth".equals(obj.get("type").getAsString())) {
             obj.addProperty("token", token);
         }
         String txt = obj.toString();
+        if (showAllLog) getLogger().info("详细: 准备发送 JSON: " + txt);
         executor.submit(() -> {
             try {
                 webSocket.sendText(txt, true).join();
+                if (showAllLog) getLogger().info("详细: 发送成功，消息: " + txt);
             } catch (Exception e) {
-                getLogger().warning("WS 数据发送失败: " + e.getMessage());
+                getLogger().warning("WS 数据发送失败: " + e.getMessage() + " - 消息: " + txt);
+                if (showAllLog) {
+                    e.printStackTrace();  // 打印完整栈
+                    getLogger().info("详细: 发送异常类型: " + e.getClass().getSimpleName());
+                }
+                // 发送失败时，不立即重连，让 onClose 处理
             }
         });
     }
@@ -280,6 +307,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("player", e.getPlayer().getName());
         o.addProperty("uuid", e.getPlayer().getUniqueId().toString());
         o.addProperty("time", Instant.now().toEpochMilli());
+        if (showAllLog) getLogger().info("详细: 触发 join 事件，玩家: " + e.getPlayer().getName() + " | UUID: " + e.getPlayer().getUniqueId());
         sendJsonAsync(o);
     }
 
@@ -291,6 +319,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("player", e.getPlayer().getName());
         o.addProperty("uuid", e.getPlayer().getUniqueId().toString());
         o.addProperty("time", Instant.now().toEpochMilli());
+        if (showAllLog) getLogger().info("详细: 触发 quit 事件，玩家: " + e.getPlayer().getName());
         sendJsonAsync(o);
     }
 
@@ -305,6 +334,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("uuid", e.getPlayer().getUniqueId().toString());
         o.addProperty("message", raw);
         o.addProperty("time", Instant.now().toEpochMilli());
+        if (showAllLog) getLogger().info("详细: 触发 chat 事件，玩家: " + e.getPlayer().getName() + " | 消息: " + raw);
         sendJsonAsync(o);
     }
 
@@ -322,6 +352,7 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("uuid", player.getUniqueId().toString());
         o.addProperty("message", deathMsg != null ? deathMsg : "");
         o.addProperty("time", Instant.now().toEpochMilli());
+        if (showAllLog) getLogger().info("详细: 触发 death 事件，玩家: " + player.getName() + " | 消息: " + (deathMsg != null ? deathMsg : "null"));
         sendJsonAsync(o);
     }
 }
