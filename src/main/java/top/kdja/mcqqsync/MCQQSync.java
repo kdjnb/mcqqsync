@@ -17,9 +17,10 @@ import org.bukkit.event.player.*;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.io.File;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.WebSocket;
+import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.nio.file.Files;
 import java.time.Instant;
 import java.util.Arrays;
@@ -29,33 +30,34 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, TabCompleter {
-    final String version="1.0.1";
-    private WebSocket webSocket;
-    private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "MCQQSync-WS"));
-    private HttpClient httpClient;
+    final String version="1.1.0";  // UDP 版
+    private DatagramSocket udpSocket;
+    private String udpHost;
+    private int udpPort;
     private String token;
     private File tokenFile;
-    private final AtomicBoolean authSent = new AtomicBoolean(false);  // 确保 auth 只发一次 per 连接
     private boolean showAllLog = false;  // 详细日志开关
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         // 设置默认配置
-        getConfig().addDefault("websocket_url", "ws://127.0.0.1:8765");
+        getConfig().addDefault("udp_host", "127.0.0.1");  // UDP 主机
+        getConfig().addDefault("udp_port", 45345);  // UDP 端口
         getConfig().addDefault("chat.send_cancelled", false);
         getConfig().addDefault("events.join", true);
         getConfig().addDefault("events.quit", true);
         getConfig().addDefault("events.chat", true);
         getConfig().addDefault("events.death", true);
-        getConfig().addDefault("show_all_log", false);  // 新增：详细日志开关
+        getConfig().addDefault("show_all_log", false);
         getConfig().options().copyDefaults(true);
         saveConfig();
 
-        showAllLog = getConfig().getBoolean("show_all_log", false);  // 加载开关
+        showAllLog = getConfig().getBoolean("show_all_log", false);
+        udpHost = getConfig().getString("udp_host", "127.0.0.1");
+        udpPort = getConfig().getInt("udp_port", 45345);
 
         // 初始化 Token 文件
         getDataFolder().mkdirs();
@@ -70,22 +72,29 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
             getLogger().info("当前 Token: " + token);
         }
 
-        httpClient = HttpClient.newHttpClient();
-        connectWebSocket();
+        // 初始化 UDP
+        try {
+            udpSocket = new DatagramSocket();  // 客户端用，随机本地端口
+            getLogger().info("UDP 已初始化，发送到 " + udpHost + ":" + udpPort);
+        } catch (IOException e) {
+            getLogger().severe("UDP 初始化失败: " + e.getMessage());
+            return;
+        }
+
+        // 发送初始 auth 包
+        sendAuthPacket();
+
         getServer().getPluginManager().registerEvents(this, this);
         Objects.requireNonNull(getCommand("mcqqsync")).setExecutor(this);
         Objects.requireNonNull(getCommand("mcqqsync")).setTabCompleter(this);
-        getLogger().info("MCQQSync 已启用");
+        getLogger().info("MCQQSync (UDP版) 已启用");
     }
 
     @Override
     public void onDisable() {
-        try {
-            if (webSocket != null) {
-                webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "插件已禁用").join();
-            }
-        } catch (Exception ignored) {}
-        executor.shutdownNow();
+        if (udpSocket != null) {
+            udpSocket.close();
+        }
         getLogger().info("MCQQSync 已禁用");
     }
 
@@ -119,28 +128,30 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
 
         if (args.length == 0) {
             sender.sendMessage(ChatColor.AQUA + "Ciallo～(∠・ω< )⌒☆");
-            sender.sendMessage(ChatColor.GREEN + "MCQQSync v"+version+" - By 卡带酱 - https://github.com/kdjnb/mcqqsync");
-            sender.sendMessage(ChatColor.YELLOW + "MCQQSync - 子命令: reload (重载配置), reconnect (强制重连), token <get|reset> (Token管理，仅控制台)");
+            sender.sendMessage(ChatColor.GREEN + "MCQQSync v"+version+" (UDP版) - By 卡带酱 - https://github.com/kdjnb/mcqqsync");
+            sender.sendMessage(ChatColor.YELLOW + "子命令: reload (重载), reconnect (重连 UDP), token <get|reset> (仅控制台)");
             return true;
         }
 
         if (args[0].equalsIgnoreCase("reload")) {
             reloadConfig();
-            showAllLog = getConfig().getBoolean("show_all_log", false);  // 重新加载开关
-            sender.sendMessage(ChatColor.GREEN + "配置已重载（详细日志: " + (showAllLog ? "启用" : "禁用") + "）");
+            showAllLog = getConfig().getBoolean("show_all_log", false);
+            udpHost = getConfig().getString("udp_host", "127.0.0.1");
+            udpPort = getConfig().getInt("udp_port", 45345);
+            sender.sendMessage(ChatColor.GREEN + "配置已重载（UDP: " + udpHost + ":" + udpPort + " | 日志: " + (showAllLog ? "启用" : "禁用") + "）");
             return true;
         } else if (args[0].equalsIgnoreCase("reconnect")) {
-            if (webSocket != null) {
-                try {
-                    webSocket.sendClose(WebSocket.NORMAL_CLOSURE, "强制重连").join();
-                } catch (Exception e) {
-                    getLogger().warning("关闭 WebSocket 时出错: " + e.getMessage());
-                }
-                webSocket = null;
+            if (udpSocket != null) {
+                udpSocket.close();
             }
-            authSent.set(false);  // 重置 auth 标志
-            connectWebSocket();
-            sender.sendMessage(ChatColor.GREEN + "WebSocket 正在强制重连...");
+            try {
+                udpSocket = new DatagramSocket();
+                getLogger().info("UDP 已重连");
+                sendAuthPacket();  // 重新发 auth
+            } catch (IOException e) {
+                getLogger().warning("UDP 重连失败: " + e.getMessage());
+            }
+            sender.sendMessage(ChatColor.GREEN + "UDP 已重连");
             return true;
         } else if (args[0].equalsIgnoreCase("token")) {
             if (!(sender instanceof ConsoleCommandSender)) {
@@ -197,106 +208,29 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         return sb.toString();
     }
 
-    private void tryReconnect() {
-        getLogger().info("MCQQSync 正在尝试重连...");
-        authSent.set(false);  // 重置 auth 标志
-        connectWebSocket();
-    }
-
-    private void connectWebSocket() {
-        final String wsUrl = getConfig().getString("websocket_url", "ws://127.0.0.1:8765");
-        if (showAllLog) getLogger().info("详细: 尝试连接到 " + wsUrl);
-        executor.submit(() -> {
-            try {
-                webSocket = httpClient.newWebSocketBuilder()
-                        .buildAsync(URI.create(wsUrl), new WebSocket.Listener() {
-                            @Override
-                            public void onOpen(WebSocket webSocket) {
-                                getLogger().info("MCQQSync 已连接到 " + wsUrl);
-                                if (showAllLog) getLogger().info("详细: onOpen 回调触发，请求消息流");
-                                webSocket.request(1);  // 只请求消息，不发送 auth
-                            }
-
-                            @Override
-                            public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
-                                getLogger().info("[MCQQSync] 收到: " + data);
-                                if (showAllLog) getLogger().info("详细: 收到消息长度: " + data.length() + " | 最后分片: " + last);
-                                webSocket.request(1);
-                                return CompletableFuture.completedFuture(null);
-                            }
-
-                            @Override
-                            public void onError(WebSocket webSocket, Throwable error) {
-                                getLogger().warning("MCQQSync WebSocket 错误: " + error.getMessage());
-                                if (showAllLog) {
-                                    error.printStackTrace();  // 打印完整栈
-                                    getLogger().info("详细: 错误类型: " + error.getClass().getSimpleName());
-                                }
-                            }
-
-                            @Override
-                            public CompletionStage<?> onClose(WebSocket ws, int statusCode, String reason) {
-                                getLogger().info("MCQQSync WebSocket 连接关闭: " + statusCode + " " + (reason != null ? " - 原因: " + reason : ""));
-                                if (showAllLog) getLogger().info("详细: 关闭原因字符串: " + (reason != null ? reason : "null"));
-                                executor.schedule(MCQQSync.this::tryReconnect, 10, TimeUnit.SECONDS);  // 延长重连间隔到 10s
-                                return CompletableFuture.completedFuture(null);
-                            }
-                        }).join();
-
-                // join() 完成后，延迟 500ms 发送 auth，给服务器缓冲
-                if (!authSent.getAndSet(true)) {
-                    executor.schedule(this::sendAuthIfNeeded, 500, TimeUnit.MILLISECONDS);
-                }
-
-            } catch (Exception e) {
-                getLogger().warning("MCQQSync 连接失败: " + e.getMessage());
-                if (showAllLog) {
-                    e.printStackTrace();  // 打印完整栈
-                    getLogger().info("详细: 连接异常类型: " + e.getClass().getSimpleName());
-                }
-                executor.schedule(this::tryReconnect, 10, TimeUnit.SECONDS);  // 失败时也延长时间
-            }
-        });
-    }
-
-    private void sendAuthIfNeeded() {
-        if (webSocket == null) {
-            getLogger().warning("尝试发送 auth 时 WS 已关闭");
-            return;
-        }
+    private void sendAuthPacket() {
         JsonObject auth = new JsonObject();
         auth.addProperty("type", "auth");
         auth.addProperty("token", token);
-        if (showAllLog) getLogger().info("详细: 准备发送 auth JSON: " + auth.toString());
-        sendJsonAsync(auth);
-        getLogger().info("已发送认证消息 (Token: " + token + ")");
+        sendUdpPacket(auth.toString());
+        getLogger().info("已发送 UDP auth 包 (Token: " + token + ")");
     }
 
-    private void sendJsonAsync(JsonObject obj) {
-        if (webSocket == null) {
-            getLogger().warning("WS 未连接; 丢包: " + obj.toString());
-            if (showAllLog) getLogger().info("详细: 丢包原因: webSocket 为 null");
+    private void sendUdpPacket(String jsonStr) {
+        if (udpSocket == null || udpSocket.isClosed()) {
+            getLogger().warning("UDP 未连接; 丢包: " + jsonStr);
             return;
         }
-        // 注意：auth 已手动添加 token，这里不重复添加（避免重复字段）
-        if (!"auth".equals(obj.get("type").getAsString())) {
-            obj.addProperty("token", token);
+        try {
+            byte[] data = jsonStr.getBytes();
+            InetAddress address = InetAddress.getByName(udpHost);
+            DatagramPacket packet = new DatagramPacket(data, data.length, address, udpPort);
+            udpSocket.send(packet);
+            if (showAllLog) getLogger().info("详细: UDP 发送成功，包大小: " + data.length + " bytes 到 " + udpHost + ":" + udpPort + " | 内容: " + jsonStr.substring(0, Math.min(50, jsonStr.length())) + (jsonStr.length() > 50 ? "..." : ""));
+        } catch (IOException e) {
+            getLogger().warning("UDP 发送失败: " + e.getMessage());
+            if (showAllLog) e.printStackTrace();
         }
-        String txt = obj.toString();
-        if (showAllLog) getLogger().info("详细: 准备发送 JSON: " + txt);
-        executor.submit(() -> {
-            try {
-                webSocket.sendText(txt, true).join();
-                if (showAllLog) getLogger().info("详细: 发送成功，消息: " + txt);
-            } catch (Exception e) {
-                getLogger().warning("WS 数据发送失败: " + e.getMessage() + " - 消息: " + txt);
-                if (showAllLog) {
-                    e.printStackTrace();  // 打印完整栈
-                    getLogger().info("详细: 发送异常类型: " + e.getClass().getSimpleName());
-                }
-                // 发送失败时，不立即重连，让 onClose 处理
-            }
-        });
     }
 
     @EventHandler
@@ -307,8 +241,9 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("player", e.getPlayer().getName());
         o.addProperty("uuid", e.getPlayer().getUniqueId().toString());
         o.addProperty("time", Instant.now().toEpochMilli());
-        if (showAllLog) getLogger().info("详细: 触发 join 事件，玩家: " + e.getPlayer().getName() + " | UUID: " + e.getPlayer().getUniqueId());
-        sendJsonAsync(o);
+        o.addProperty("token", token);  // 加 token
+        if (showAllLog) getLogger().info("详细: 触发 join 事件，玩家: " + e.getPlayer().getName());
+        sendUdpPacket(o.toString());
     }
 
     @EventHandler
@@ -319,8 +254,9 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("player", e.getPlayer().getName());
         o.addProperty("uuid", e.getPlayer().getUniqueId().toString());
         o.addProperty("time", Instant.now().toEpochMilli());
+        o.addProperty("token", token);  // 加 token
         if (showAllLog) getLogger().info("详细: 触发 quit 事件，玩家: " + e.getPlayer().getName());
-        sendJsonAsync(o);
+        sendUdpPacket(o.toString());
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -334,8 +270,9 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("uuid", e.getPlayer().getUniqueId().toString());
         o.addProperty("message", raw);
         o.addProperty("time", Instant.now().toEpochMilli());
+        o.addProperty("token", token);  // 加 token
         if (showAllLog) getLogger().info("详细: 触发 chat 事件，玩家: " + e.getPlayer().getName() + " | 消息: " + raw);
-        sendJsonAsync(o);
+        sendUdpPacket(o.toString());
     }
 
     @EventHandler
@@ -352,7 +289,8 @@ public class MCQQSync extends JavaPlugin implements Listener, CommandExecutor, T
         o.addProperty("uuid", player.getUniqueId().toString());
         o.addProperty("message", deathMsg != null ? deathMsg : "");
         o.addProperty("time", Instant.now().toEpochMilli());
+        o.addProperty("token", token);  // 加 token
         if (showAllLog) getLogger().info("详细: 触发 death 事件，玩家: " + player.getName() + " | 消息: " + (deathMsg != null ? deathMsg : "null"));
-        sendJsonAsync(o);
+        sendUdpPacket(o.toString());
     }
 }
